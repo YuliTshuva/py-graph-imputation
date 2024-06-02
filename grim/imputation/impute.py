@@ -6,8 +6,7 @@ import timeit
 from collections import defaultdict
 import os.path
 import json
-
-
+import time
 import numpy as np
 from .cutils import open_ambiguities, create_hap_list, deepcopy_list
 from .cypher_plan_b import CypherQueryPlanB
@@ -16,9 +15,171 @@ from .cypher_query import CypherQuery
 comp_cand_epsilon = 1e-15
 
 
+def extract_locuses(haplotype):
+    """Get one haplotype and return its locuses"""
+    return [element[:4] if element[:3].isalpha() else element[0] for element in haplotype.split("^")]
+
+
+def get_3_dominant_locuses(locuses, threshold=3):
+    """
+    prioritize locuses by the list Sapir gave us:
+    1. A
+    2. B
+    3. DRB1
+    4. C
+    5. DQB1
+    6. DPB1
+    7. DRB3/4/5
+    8. DPA1 (but if you already have DPB1 but not DQB1 then switch between 8 and 9)
+    9. DQA1
+    """
+    locuses = list(set(locuses))
+    dominant_locuses = []
+    if "A" in locuses:
+        dominant_locuses.append("A")
+    if "B" in locuses:
+        dominant_locuses.append("B")
+    if "DRB1" in locuses:
+        dominant_locuses.append("DRB1")
+    if len(dominant_locuses) == threshold:
+        return dominant_locuses
+    if "C" in locuses:
+        dominant_locuses.append("C")
+    if len(dominant_locuses) == threshold:
+        return dominant_locuses
+    if "DQB1" in locuses:
+        dominant_locuses.append("DQB1")
+    if len(dominant_locuses) == threshold:
+        return dominant_locuses
+    if "DPB1" in locuses:
+        dominant_locuses.append("DPB1")
+    if len(dominant_locuses) == threshold:
+        return dominant_locuses
+    if "DRB3" in locuses or "DRB4" in locuses or "DRB5" in locuses:
+        dominant_locuses.append("DRB3/4/5")
+    if len(dominant_locuses) == threshold:
+        return dominant_locuses
+    if "DPB1" in locuses and "DQB1" not in locuses:
+        if "DQA1" in locuses:
+            dominant_locuses.append("DQA1")
+        if len(dominant_locuses) == threshold:
+            return dominant_locuses
+        if "DPA1" in locuses:
+            dominant_locuses.append("DPA1")
+        if len(dominant_locuses) == threshold:
+            return dominant_locuses
+    else:
+        if "DPA1" in locuses:
+            dominant_locuses.append("DPA1")
+        if len(dominant_locuses) == threshold:
+            return dominant_locuses
+        if "DQA1" in locuses:
+            dominant_locuses.append("DQA1")
+        if len(dominant_locuses) == threshold:
+            return dominant_locuses
+    return dominant_locuses
+
+
+def filter_haplotype(haplotype, dominant_locuses):
+    """Filter haplotype by the dominant locuses"""
+    haplotype = haplotype.split("^")
+    return "^".join(
+        [element for element in haplotype if (element[:4] in dominant_locuses) or (element[0] in dominant_locuses)])
+
+
+def split_gl(subject_gl):
+    """split the gl string into the top-3 dominant part of the haplotype and the less dominant."""
+    subject_locuses = extract_locuses(subject_gl)
+    dominant_loc = get_3_dominant_locuses(subject_locuses)
+    short_gl = filter_haplotype(subject_gl, dominant_loc)
+
+    extra_locuses = [locus for locus in subject_locuses if locus not in dominant_loc]
+    extra_gl = filter_haplotype(subject_gl, extra_locuses)
+
+    return short_gl, extra_gl
+
+
+def filter_results(res_muugs, res_haps, extra_gl):
+    """
+    Filter the result to the ones consistent with the extra_gl.
+
+    res_muugs: dictionary:
+    {
+        'MaxProb': 1.2370678464000013e-16,
+        'Haps': {'A*01:01+A*33:03^B*08:01+B*44:03^C*07:01+C*07:01^DQB1*02:01+DQB1*02:01^DRB1*03:01+DRB1*07:01': 1.5523456571675956e-16},
+        'Pops': {'CAU,CAU': 1.5523456571675956e-16}
+    }
+
+    res_haps: dictionary:
+    {
+        'MaxProb': 1.2370678464000013e-16,
+        'Haps': [['A*01:01~B*08:01~C*07:01~DQB1*02:01~DRB1*03:01', 'A*33:03~B*44:03~C*07:01~DQB1*02:01~DRB1*07:01'],
+                 ['A*33:03~B*08:01~C*07:01~DQB1*02:01~DRB1*03:01', 'A*01:01~B*44:03~C*07:01~DQB1*02:01~DRB1*07:01'],
+                 ['A*01:01~B*44:03~C*07:01~DQB1*02:01~DRB1*03:01', 'A*33:03~B*08:01~C*07:01~DQB1*02:01~DRB1*07:01'],
+                 ['A*33:03~B*44:03~C*07:01~DQB1*02:01~DRB1*03:01', 'A*01:01~B*08:01~C*07:01~DQB1*02:01~DRB1*07:01']],
+        'Probs': [1.2370678464000013e-16, 2.990312032960011e-17, 3.0052635931248134e-22, 1.6243602208000046e-18],
+        'Pops': [['CAU', 'CAU'], ['CAU', 'CAU'], ['CAU', 'CAU'], ['CAU', 'CAU']]
+    }
+
+    Extra GL:  C*07:01+C*07:01^DQB1*02:01+DQB1*02:01
+
+    Short GL:  A*01:01+A*33:03^B*08:01+B*44:03^DRB1*03:01+DRB1*07:01
+    """
+
+    split_extra_gl_into_locus = extra_gl.split("^")
+
+    dct = {locus.split("*")[0]: [set(locus.split("+")[0].split("/")), set(locus.split("+")[1].split("/"))]
+           for locus in split_extra_gl_into_locus}
+
+    haps = res_haps["Haps"]
+    filter_idx = []
+    for idx, pair in enumerate(haps):
+        check = True
+        hap1, hap2 = pair[0], pair[1]
+        for allele1, allele2 in zip(hap1.split("~"), hap2.split("~")):
+            loc = allele1.split("*")[0]
+            if loc in dct:
+                if not (allele1 in dct[loc][0] and allele2 in dct[loc][1]) or (
+                        allele1 in dct[loc][1] and allele2 in dct[loc][0]):
+                    check = False
+                    break
+        if check:
+            filter_idx.append(idx)
+
+    res_haps["Haps"] = [res_haps["Haps"][idx] for idx in filter_idx]
+    res_haps["Probs"] = [res_haps["Probs"][idx] for idx in filter_idx]
+    res_haps["Pops"] = [res_haps["Pops"][idx] for idx in filter_idx]
+    if res_haps["Probs"]:
+        res_haps["MaxProb"] = max(res_haps["Probs"])
+    else:
+        res_haps["MaxProb"] = 0
+        return None, None
+
+    # Find the haplotype with the maximum probability
+    max_prob_idx = res_haps["Probs"].index(res_haps["MaxProb"])
+    max_prob_hap = res_haps["Haps"][max_prob_idx]
+    max_prob_hap = [hap.split("~") for hap in max_prob_hap]
+    # Find the population with the maximum probability
+    max_prob_pop = res_haps["Pops"][max_prob_idx]
+    max_prob = res_haps["MaxProb"]
+
+    # Reconstruction of the haplotype with the maximum probability
+    muug = ""
+    for i in range(len(max_prob_hap[0])):
+        muug += max_prob_hap[0][i] + "+" + max_prob_hap[1][i] + "^"
+    # Remove the last "^"
+    muug = muug[:-1]
+
+    res_muugs["MaxProb"] = max_prob
+    res_muugs["Haps"] = {muug: max_prob}
+    res_muugs["Pops"] = {",".join(max_prob_pop): max_prob}
+
+    return res_muugs, res_haps
+
+
 def chunks(l, n):
     for i in range(0, len(l), n):
-        yield l[i : i + n]
+        yield l[i: i + n]
 
 
 def write_best_prob(name_gl, res, probs, numOfResult, fout, sign=","):
@@ -442,16 +603,16 @@ class Imputation(object):
         return ProbWithIndexes
 
     def calc_haps_pairs(
-        self,
-        Haps1,
-        Haps2,
-        Prob1WithIndexes,
-        Prob2WithIndexes,
-        epsilon,
-        hap_total,
-        pop_res,
-        maxProb,
-        geno_seen,
+            self,
+            Haps1,
+            Haps2,
+            Prob1WithIndexes,
+            Prob2WithIndexes,
+            epsilon,
+            hap_total,
+            pop_res,
+            maxProb,
+            geno_seen,
     ):
 
         for h in range(len(Prob1WithIndexes)):
@@ -463,31 +624,31 @@ class Imputation(object):
             for k in range(prob2Len):
                 if Prob2WithIndexes[k][0] >= x:
                     if (
-                        self.priorMatrix[Prob1WithIndexes[h][1][1]][
-                            Prob2WithIndexes[k][1][1]
-                        ]
-                        > 0
+                            self.priorMatrix[Prob1WithIndexes[h][1][1]][
+                                Prob2WithIndexes[k][1][1]
+                            ]
+                            > 0
                     ):
                         hap1 = Haps1[Prob1WithIndexes[h][1][0]]
                         hap2 = Haps2[Prob2WithIndexes[k][1][0]]
                         if (
-                            hap1 != hap2
-                            and (
-                                self.priorMatrix[Prob1WithIndexes[h][1][1]][
-                                    Prob2WithIndexes[k][1][1]
-                                ]
-                                * Prob2WithIndexes[k][0]
-                            )
-                            >= x
+                                hap1 != hap2
+                                and (
+                                        self.priorMatrix[Prob1WithIndexes[h][1][1]][
+                                            Prob2WithIndexes[k][1][1]
+                                        ]
+                                        * Prob2WithIndexes[k][0]
+                                )
+                                >= x
                         ) or (
-                            hap1 == hap2
-                            and (
-                                self.priorMatrix[Prob1WithIndexes[h][1][1]][
-                                    Prob2WithIndexes[k][1][1]
-                                ]
-                                * Prob2WithIndexes[k][0]
-                            )
-                            >= x_homozygote
+                                hap1 == hap2
+                                and (
+                                        self.priorMatrix[Prob1WithIndexes[h][1][1]][
+                                            Prob2WithIndexes[k][1][1]
+                                        ]
+                                        * Prob2WithIndexes[k][0]
+                                )
+                                >= x_homozygote
                         ):
 
                             # hap1_list = sorted(hap1.split('~'))
@@ -513,11 +674,11 @@ class Imputation(object):
                                 geno_seen.add(geno_id)
 
                                 prob = (
-                                    Prob1WithIndexes[h][0]
-                                    * Prob2WithIndexes[k][0]
-                                    * self.priorMatrix[Prob1WithIndexes[h][1][1]][
-                                        Prob2WithIndexes[k][1][1]
-                                    ]
+                                        Prob1WithIndexes[h][0]
+                                        * Prob2WithIndexes[k][0]
+                                        * self.priorMatrix[Prob1WithIndexes[h][1][1]][
+                                            Prob2WithIndexes[k][1][1]
+                                        ]
                                 )
 
                                 if hap1 != hap2:
@@ -548,19 +709,19 @@ class Imputation(object):
         return maxProb
 
     def calc_haps_pairs_haplotype(
-        self,
-        Haps1,
-        Haps2,
-        Prob1WithIndexes,
-        Prob2WithIndexes,
-        epsilon,
-        hap_total,
-        pop_res,
-        maxProb,
-        haps_pairs,
-        geno_seen,
-        pop_res_haplo,
-        p_total,
+            self,
+            Haps1,
+            Haps2,
+            Prob1WithIndexes,
+            Prob2WithIndexes,
+            epsilon,
+            hap_total,
+            pop_res,
+            maxProb,
+            haps_pairs,
+            geno_seen,
+            pop_res_haplo,
+            p_total,
     ):
 
         for h in range(len(Prob1WithIndexes)):
@@ -572,31 +733,31 @@ class Imputation(object):
             for k in range(prob2Len):
                 if Prob2WithIndexes[k][0] >= x:
                     if (
-                        self.priorMatrix[Prob1WithIndexes[h][1][1]][
-                            Prob2WithIndexes[k][1][1]
-                        ]
-                        > 0
+                            self.priorMatrix[Prob1WithIndexes[h][1][1]][
+                                Prob2WithIndexes[k][1][1]
+                            ]
+                            > 0
                     ):
                         hap1 = Haps1[Prob1WithIndexes[h][1][0]]
                         hap2 = Haps2[Prob2WithIndexes[k][1][0]]
                         if (
-                            hap1 != hap2
-                            and (
-                                self.priorMatrix[Prob1WithIndexes[h][1][1]][
-                                    Prob2WithIndexes[k][1][1]
-                                ]
-                                * Prob2WithIndexes[k][0]
-                            )
-                            >= x
+                                hap1 != hap2
+                                and (
+                                        self.priorMatrix[Prob1WithIndexes[h][1][1]][
+                                            Prob2WithIndexes[k][1][1]
+                                        ]
+                                        * Prob2WithIndexes[k][0]
+                                )
+                                >= x
                         ) or (
-                            hap1 == hap2
-                            and (
-                                self.priorMatrix[Prob1WithIndexes[h][1][1]][
-                                    Prob2WithIndexes[k][1][1]
-                                ]
-                                * Prob2WithIndexes[k][0]
-                            )
-                            >= x_homozygote
+                                hap1 == hap2
+                                and (
+                                        self.priorMatrix[Prob1WithIndexes[h][1][1]][
+                                            Prob2WithIndexes[k][1][1]
+                                        ]
+                                        * Prob2WithIndexes[k][0]
+                                )
+                                >= x_homozygote
                         ):
 
                             # hap1_list = sorted(hap1.split('~'))
@@ -619,11 +780,11 @@ class Imputation(object):
                                 geno_seen.add(geno_id)
 
                                 prob = (
-                                    Prob1WithIndexes[h][0]
-                                    * Prob2WithIndexes[k][0]
-                                    * self.priorMatrix[Prob1WithIndexes[h][1][1]][
-                                        Prob2WithIndexes[k][1][1]
-                                    ]
+                                        Prob1WithIndexes[h][0]
+                                        * Prob2WithIndexes[k][0]
+                                        * self.priorMatrix[Prob1WithIndexes[h][1][1]][
+                                            Prob2WithIndexes[k][1][1]
+                                        ]
                                 )
 
                                 if hap1 != hap2:
@@ -787,22 +948,22 @@ class Imputation(object):
                 for k in range(prob2Len):
                     if Prob2WithIndexes[k][0] >= x:
                         if (
-                            self.priorMatrix[Prob1WithIndexes[h][1][1]][
-                                Prob2WithIndexes[k][1][1]
-                            ]
-                            > 0
-                        ):
-                            if (
                                 self.priorMatrix[Prob1WithIndexes[h][1][1]][
                                     Prob2WithIndexes[k][1][1]
                                 ]
                                 > 0
-                            ):
-                                if (
+                        ):
+                            if (
                                     self.priorMatrix[Prob1WithIndexes[h][1][1]][
                                         Prob2WithIndexes[k][1][1]
                                     ]
-                                    * Prob2WithIndexes[k][0]
+                                    > 0
+                            ):
+                                if (
+                                        self.priorMatrix[Prob1WithIndexes[h][1][1]][
+                                            Prob2WithIndexes[k][1][1]
+                                        ]
+                                        * Prob2WithIndexes[k][0]
                                 ) >= x:
                                     # NOTE: there is a bug in places
                                     #  places = self.cal_prob(Prob1[h], Prob2[k], epsilon)
@@ -879,7 +1040,7 @@ class Imputation(object):
                                 haps[j][k][i] = "/".join(list(probs.keys()))
 
     def reduce_phase_to_commons_alleles(
-        self, haps, N_Loc, commons_number=1, planc=False
+            self, haps, N_Loc, commons_number=1, planc=False
     ):
         for j in range(len(haps)):
             for k in range(2):
@@ -1099,7 +1260,7 @@ class Imputation(object):
                 if div_dict == {}:
                     result = all(elem in missing for elem in division)
                     if (
-                        result
+                            result
                     ):  # and one:#len(division) == 1 and len(missing) == 1 and division[0] == missing[0]:
                         type = self.cypher_plan_b.findTypeFromIndexes(division)
                         div_dict = self.netGraph.haps_with_probs_by_label(type)
@@ -1160,9 +1321,9 @@ class Imputation(object):
                 for key in dict_all.keys():
                     list_key = key.split("~")
                     list_key = (
-                        list_key[: not_in_data[0] - 1]
-                        + string_option[1]
-                        + list_key[not_in_data[0] - 1 :]
+                            list_key[: not_in_data[0] - 1]
+                            + string_option[1]
+                            + list_key[not_in_data[0] - 1:]
                     )
                     dict_res["~".join(sorted(list_key))] = [
                         x * (self._factor_missing_data ** len(all_missing))
@@ -1582,7 +1743,7 @@ class Imputation(object):
         return open_ambiguities(hap, loc, split_loc)
 
     def comp_cand(
-        self, gl_string, binary, epsilon, n, MUUG_output, haps_output, planb, em
+            self, gl_string, binary, epsilon, n, MUUG_output, haps_output, planb, em
     ):
         # receives a list of phases and computes haps and
         # probabilties and accumulate cartesian productEpsilon=0.0001
@@ -1753,7 +1914,7 @@ class Imputation(object):
 
     # find the haps of race1-race2, and sum the probs
     def write_haplotype(
-        self, race1, race2, haps, pops, probs, name_gl, foutHap, foutPop
+            self, race1, race2, haps, pops, probs, name_gl, foutHap, foutPop
     ):
         haps_dict = dict()
         for i, line in enumerate(pops):
@@ -1867,15 +2028,15 @@ class Imputation(object):
                     # calc priority
                     for i in range(popLen):
                         tmp_matrix[race, i] = (
-                            tmp_matrix[race, i] + priority["gamma"] * 2
+                                tmp_matrix[race, i] + priority["gamma"] * 2
                         )
                     tmp_matrix = tmp_matrix + tmp_matrix.transpose()
                     tmp_matrix[race, race] -= priority["gamma"] * 2
 
                     tmp_matrix = (
-                        priority["eta"] * np.ones((popLen, popLen))
-                        + tmp_matrix
-                        + priority["beta"] * Imatrix
+                            priority["eta"] * np.ones((popLen, popLen))
+                            + tmp_matrix
+                            + priority["beta"] * Imatrix
                     )
 
                     self.priorMatrix += tmp_matrix
@@ -1891,7 +2052,7 @@ class Imputation(object):
                     tmp_matrix[race1, race2] -= priority["gamma"]
 
                     tmp_matrix[race1, race2] = (
-                        tmp_matrix[race1, race2] + priority["alpha"]
+                            tmp_matrix[race1, race2] + priority["alpha"]
                     )
 
                     if race1 != race2:
@@ -1903,9 +2064,9 @@ class Imputation(object):
                     if race1 != race2:
                         tmp_matrix[race2, race2] += priority["delta"]
                     tmp_matrix = (
-                        priority["eta"] * np.ones((popLen, popLen))
-                        + tmp_matrix
-                        + priority["beta"] * Imatrix
+                            priority["eta"] * np.ones((popLen, popLen))
+                            + tmp_matrix
+                            + priority["beta"] * Imatrix
                     )
 
                     self.priorMatrix += tmp_matrix
@@ -1915,9 +2076,9 @@ class Imputation(object):
         for i in range(popLen):
             for j in range(popLen):
                 self.priorMatrix[i][j] = (
-                    self.priorMatrix[i][j]
-                    * self.count_by_prob[i]
-                    * self.count_by_prob[j]
+                        self.priorMatrix[i][j]
+                        * self.count_by_prob[i]
+                        * self.count_by_prob[j]
                 )
                 prior_sum += self.priorMatrix[i][j]
 
@@ -1938,19 +2099,19 @@ class Imputation(object):
         return res
 
     def impute_one(
-        self,
-        subject_id,
-        gl,
-        binary,
-        race1,
-        race2,
-        priority,
-        epsilon,
-        n,
-        MUUG_output,
-        haps_output,
-        planb,
-        em,
+            self,
+            subject_id,
+            gl,
+            binary,
+            race1,
+            race2,
+            priority,
+            epsilon,
+            n,
+            MUUG_output,
+            haps_output,
+            planb,
+            em,
     ):  # em
         clean_gl = clean_up_gl(gl)
         if self.unk_priors == "MR":
@@ -2018,7 +2179,7 @@ class Imputation(object):
 
         with f as lines:
             for (i, name_gl) in enumerate(lines):
-                try:
+                if True:
                     name_gl = name_gl.rstrip()  # remove trailing whitespace
                     if "," in name_gl:
                         list_gl = name_gl.split(",")
@@ -2043,9 +2204,12 @@ class Imputation(object):
                     self.plan = "a"
                     self.option_1 = 0
                     self.option_2 = 0
+                    # Find short (important) and extra gl string
+                    short_gl, extra_gl = split_gl(subject_gl)
+                    # Calculate for the shord gl string
                     subject_id, res_muugs, res_haps = self.impute_one(
                         subject_id,
-                        subject_gl,
+                        short_gl,
                         subject_bin,
                         race1,
                         race2,
@@ -2058,12 +2222,16 @@ class Imputation(object):
                         em,
                     )  # em
 
+                    # Adjust by the extra gl string, if exitst
+                    if len(extra_gl) > 0:
+                        res_muugs, res_haps = filter_results(res_muugs, res_haps, extra_gl)
+
                     if res_muugs is None:
                         problem.write(str(i) + "," + str(subject_id) + "\n")
                         continue
 
                     if (
-                        len(res_haps["Haps"]) == 0 or res_haps["Haps"] == "NaN"
+                            len(res_haps["Haps"]) == 0 or res_haps["Haps"] == "NaN"
                     ) and len(res_muugs["Haps"]) == 0:
                         miss.write(str(i) + "," + str(subject_id) + "\n")
 
@@ -2138,7 +2306,7 @@ class Imputation(object):
                     print(time_taken)
                     if self.verbose:
                         self.logger.info("Time taken: " + str(time_taken))
-                except:
+                else:
                     print(f"{i} Subject: {subject_id} - Exception")
                     problem.write(str(name_gl) + "\n")
                     continue
